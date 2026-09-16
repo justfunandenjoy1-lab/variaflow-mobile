@@ -15,7 +15,7 @@ android {
         versionName = "1.0.0"
 
         ndk {
-            abiFilters.add("arm64-v8a")
+            abiFilters += "arm64-v8a"
         }
     }
 
@@ -63,5 +63,6 @@ dependencies {
     implementation(libs.androidx.media3.exoplayer)
     implementation(libs.androidx.media3.ui)
     implementation(libs.ffmpeg.kit.full)
+    implementation("com.arthenica:smart-exception-java:0.2.1")
     implementation(libs.kotlinx.coroutines.android)
 }
