@@ -18,10 +18,15 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.7
+          cache-disabled: true
 
       - name: Generate Gradle Wrapper
         run: gradle wrapper
@@ -29,7 +34,14 @@ jobs:
       - name: Build Debug APK
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log || BUILD_FAILED=true
+          if [ "$BUILD_FAILED" = "true" ]; then
+            echo "## ❌ Build Failure Details" >> $GITHUB_STEP_SUMMARY
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            grep -A 15 -B 2 "What went wrong:" build.log >> $GITHUB_STEP_SUMMARY \vert{}\vert{} tail -n 25 build.log >>$GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
