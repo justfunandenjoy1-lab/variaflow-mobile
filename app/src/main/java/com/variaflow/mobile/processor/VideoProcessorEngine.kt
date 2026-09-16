@@ -1,7 +1,6 @@
 package com.variaflow.mobile.processor
 
 import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.FFmpegKitConfig
 import com.arthenica.ffmpegkit.ReturnCode
 import com.arthenica.ffmpegkit.SessionState
 import com.variaflow.mobile.model.AudioCodecOption
@@ -18,7 +17,9 @@ object VideoProcessorEngine {
 
     fun cancelActiveJob() {
         activeSessionId?.let { id ->
-            FFmpegKit.cancel(id)
+            try {
+                FFmpegKit.cancel(id)
+            } catch (_: Throwable) {}
             activeSessionId = null
         }
     }
@@ -37,7 +38,11 @@ object VideoProcessorEngine {
         cmdArgs.add("-i")
         cmdArgs.add(sourceMetadata.localFilePath)
 
-        val scaleFilter = "scale=${settings.targetWidth}:${settings.targetHeight}:force_original_aspect_ratio=decrease,pad=${settings.targetWidth}:${settings.targetHeight}:(ow-iw)/2:(oh-ih)/2"
+        // Ensure resolution dimensions are divisible by 2 to prevent encoder failure
+        val targetW = if (settings.targetWidth % 2 == 0) settings.targetWidth else settings.targetWidth - 1
+        val targetH = if (settings.targetHeight % 2 == 0) settings.targetHeight else settings.targetHeight - 1
+
+        val scaleFilter = "scale=$targetW:$targetH:force_original_aspect_ratio=decrease,pad=$targetW:$targetH:(ow-iw)/2:(oh-ih)/2"
         cmdArgs.add("-vf")
         cmdArgs.add(scaleFilter)
         cmdArgs.add("-r")
@@ -47,7 +52,7 @@ object VideoProcessorEngine {
         cmdArgs.add("-b:v")
         cmdArgs.add("${settings.targetVideoBitrateKbps}k")
         cmdArgs.add("-preset")
-        cmdArgs.add("medium")
+        cmdArgs.add("veryfast")
 
         if (settings.audioCodec == AudioCodecOption.COPY) {
             cmdArgs.add("-c:a")
@@ -69,53 +74,67 @@ object VideoProcessorEngine {
         }
 
         cmdArgs.add(outputFile.absolutePath)
-        val fullCommand = FFmpegKitConfig.argumentsToString(cmdArgs.toTypedArray())
 
-        val session = FFmpegKit.executeAsync(
-            fullCommand,
+        val session = FFmpegKit.executeWithArgumentsAsync(
+            cmdArgs.toTypedArray(),
             { executionSession ->
-                activeSessionId = null
-                val returnCode = executionSession.returnCode
-                val state = executionSession.state
+                try {
+                    activeSessionId = null
+                    val returnCode = executionSession.returnCode
+                    val state = executionSession.state
+                    val failStack = executionSession.failStackTrace
 
-                if (ReturnCode.isSuccess(returnCode)) {
-                    trySend(
-                        ProcessingProgress(
-                            isRunning = false,
-                            percentage = 100,
-                            stage = "Completed successfully",
-                            outputFilePath = outputFile.absolutePath,
-                            isCompleted = true
+                    if (ReturnCode.isSuccess(returnCode)) {
+                        trySend(
+                            ProcessingProgress(
+                                isRunning = false,
+                                percentage = 100,
+                                stage = "Completed successfully",
+                                outputFilePath = outputFile.absolutePath,
+                                isCompleted = true
+                            )
                         )
-                    )
-                } else if (ReturnCode.isCancel(returnCode) || state == SessionState.FAILED && executionSession.failStackTrace.contains("cancel", true)) {
-                    if (outputFile.exists()) outputFile.delete()
-                    trySend(ProcessingProgress(isRunning = false, percentage = 0, stage = "Cancelled", isCancelled = true))
-                } else {
-                    if (outputFile.exists()) outputFile.delete()
-                    val errorLog = executionSession.allLogsAsString ?: "Encoding failure."
-                    trySend(ProcessingProgress(isRunning = false, percentage = 0, stage = "Failed", errorMessage = errorLog.takeLast(200)))
+                    } else if (ReturnCode.isCancel(returnCode) || (state == SessionState.FAILED && failStack?.contains("cancel", true) == true)) {
+                        if (outputFile.exists()) outputFile.delete()
+                        trySend(ProcessingProgress(isRunning = false, percentage = 0, stage = "Cancelled", isCancelled = true))
+                    } else {
+                        if (outputFile.exists()) outputFile.delete()
+                        val errorLog = executionSession.allLogsAsString ?: "Encoding failure."
+                        val humanMsg = when {
+                            errorLog.contains("No space left", true) -> "Storage full."
+                            errorLog.contains("Invalid data", true) -> "Corrupt video data."
+                            else -> "Encoding failed: " + errorLog.takeLast(150).trim()
+                        }
+                        trySend(ProcessingProgress(isRunning = false, percentage = 0, stage = "Failed", errorMessage = humanMsg))
+                    }
+                } catch (t: Throwable) {
+                    trySend(ProcessingProgress(isRunning = false, percentage = 0, stage = "Failed", errorMessage = t.message))
+                } finally {
+                    channel.close()
                 }
-                channel.close()
             },
-            { },
+            { /* log callback */ },
             { stats ->
-                val timeInMs = stats.time
-                if (timeInMs > 0 && durationMs > 0) {
-                    val rawPercent = ((timeInMs.toDouble() / durationMs.toDouble()) * 100).toInt().coerceIn(2, 99)
-                    trySend(ProcessingProgress(isRunning = true, percentage = rawPercent, stage = "Encoding ($rawPercent%)..."))
-                }
+                try {
+                    val timeInMs = stats.time
+                    if (timeInMs > 0 && durationMs > 0) {
+                        val rawPercent = ((timeInMs.toDouble() / durationMs.toDouble()) * 100).toInt().coerceIn(2, 99)
+                        trySend(ProcessingProgress(isRunning = true, percentage = rawPercent, stage = "Encoding ($rawPercent%)..."))
+                    }
+                } catch (_: Throwable) {}
             }
         )
 
         activeSessionId = session.sessionId
 
         awaitClose {
-            if (activeSessionId == session.sessionId) {
-                FFmpegKit.cancel(session.sessionId)
-                activeSessionId = null
-                if (outputFile.exists()) outputFile.delete()
-            }
+            try {
+                if (activeSessionId == session.sessionId) {
+                    FFmpegKit.cancel(session.sessionId)
+                    activeSessionId = null
+                    if (outputFile.exists()) outputFile.delete()
+                }
+            } catch (_: Throwable) {}
         }
     }
 }
